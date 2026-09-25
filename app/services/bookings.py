@@ -5,6 +5,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
 
 from app.errors import ConflictError, NotFoundError, UnprocessableError
+from app.logging_config import log_event
 from app.models import Booking, BookingStatus, CentreTest, User, utcnow
 from app.schemas import BookingCreate
 from app.services.pagination import paginate
@@ -25,7 +26,7 @@ ALLOWED_TRANSITIONS: dict[BookingStatus, set[BookingStatus]] = {
 def transition(booking: Booking, new_status: BookingStatus) -> None:
     if new_status not in ALLOWED_TRANSITIONS.get(booking.status, set()):
         raise ConflictError(f"A {booking.status.value} booking cannot become {new_status.value}")
-    log.info("event=booking_status_changed booking_id=%s from=%s to=%s", booking.id, booking.status.value, new_status.value)
+    log_event(log, logging.INFO, "booking_status_changed", booking_id=booking.id, from_status=booking.status.value, to_status=new_status.value)
     booking.status = new_status
 
 
@@ -45,7 +46,7 @@ def create_booking(db: Session, user: User, data: BookingCreate) -> Booking:
     )
     db.add(booking)
     db.commit()
-    log.info("event=booking_created booking_id=%s user_id=%s amount=%s", booking.id, user.id, booking.amount)
+    log_event(log, logging.INFO, "booking_created", booking_id=booking.id, user_id=user.id, amount=str(booking.amount))
     return booking
 
 

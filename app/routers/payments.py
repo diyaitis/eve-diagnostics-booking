@@ -9,6 +9,7 @@ from pydantic import ValidationError
 
 from app.config import get_settings
 from app.deps import CurrentUser, DbSession, PaymentProvider
+from app.logging_config import log_event
 from app.schemas import PaymentCreate, PaymentOut, WebhookIn, WebhookOut
 from app.security import verify_webhook_signature
 from app.services import payments
@@ -52,7 +53,7 @@ def payment_webhook(
     """Receives payment-status updates from the payment provider. Safe to call repeatedly:
     an `event_id` is applied at most once, and later copies return the stored result."""
     if not verify_webhook_signature(body, x_webhook_signature):
-        log.warning("event=webhook_rejected reason=bad_signature")
+        log_event(log, logging.WARNING, "webhook_rejected", reason="bad_signature")
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid webhook signature")
 
     try:

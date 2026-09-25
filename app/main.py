@@ -8,6 +8,8 @@ from app import models  # noqa: F401  (registers the tables on Base.metadata)
 from app.config import get_settings
 from app.database import Base, engine
 from app.errors import DomainError
+from app.logging_config import setup_logging
+from app.middleware import install_request_logging
 from app.routers import auth, bookings, catalog, payments
 
 DESCRIPTION = """
@@ -26,10 +28,8 @@ async def lifespan(_app: FastAPI):
 
 
 def create_app() -> FastAPI:
-    logging.basicConfig(
-        level=get_settings().log_level,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
+    settings = get_settings()
+    setup_logging(settings.log_level, settings.log_format)
 
     app = FastAPI(title="EVE Diagnostics Booking API", version="1.0.0", description=DESCRIPTION, lifespan=lifespan)
 
@@ -40,6 +40,8 @@ def create_app() -> FastAPI:
     @app.get("/health", tags=["meta"])
     def health():
         return {"status": "ok"}
+
+    install_request_logging(app)
 
     app.include_router(auth.router)
     app.include_router(catalog.router)

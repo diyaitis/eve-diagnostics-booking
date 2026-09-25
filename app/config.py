@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     allow_simulated_outcome: bool = True
 
     log_level: str = "INFO"
+    log_format: str = "json"  # "json" (one object per line) or "text"
 
 
 @lru_cache

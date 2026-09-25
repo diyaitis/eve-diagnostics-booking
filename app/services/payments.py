@@ -6,6 +6,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.errors import ConflictError, ForbiddenError, NotFoundError
+from app.logging_config import log_event
 from app.models import Booking, BookingStatus, Payment, PaymentStatus, User, WebhookEvent, WebhookResult
 from app.schemas import PaymentCreate, WebhookIn
 from app.services import bookings
@@ -29,9 +30,9 @@ def apply_payment_result(booking: Booking, payment: Payment, outcome: PaymentSta
     if payment.status == outcome:
         return WebhookResult.NO_CHANGE
     if payment.status != PaymentStatus.PENDING:
-        log.warning(
-            "event=payment_result_ignored payment_id=%s current=%s received=%s",
-            payment.id, payment.status.value, outcome.value,
+        log_event(
+            log, logging.WARNING, "payment_result_ignored",
+            payment_id=payment.id, current=payment.status.value, received=outcome.value,
         )
         return WebhookResult.IGNORED
 
@@ -43,11 +44,11 @@ def apply_payment_result(booking: Booking, payment: Payment, outcome: PaymentSta
     elif outcome == PaymentStatus.SUCCESS:
         # Money was taken for a booking that is no longer payable (e.g. cancelled meanwhile).
         # The payment is recorded truthfully; the booking is left alone and flagged for a refund.
-        log.warning(
-            "event=payment_for_closed_booking payment_id=%s booking_id=%s booking_status=%s needs_refund=true",
-            payment.id, booking.id, booking.status.value,
+        log_event(
+            log, logging.WARNING, "payment_for_closed_booking",
+            payment_id=payment.id, booking_id=booking.id, booking_status=booking.status.value, needs_refund=True,
         )
-    log.info("event=payment_result_applied payment_id=%s status=%s", payment.id, outcome.value)
+    log_event(log, logging.INFO, "payment_result_applied", payment_id=payment.id, status=outcome.value)
     return WebhookResult.APPLIED
 
 
@@ -81,7 +82,7 @@ def create_payment(
     if outcome != PaymentStatus.PENDING:
         apply_payment_result(booking, payment, outcome)
     db.commit()
-    log.info("event=payment_created payment_id=%s booking_id=%s status=%s", payment.id, booking.id, payment.status.value)
+    log_event(log, logging.INFO, "payment_created", payment_id=payment.id, booking_id=booking.id, status=payment.status.value)
     return payment
 
 
@@ -108,7 +109,7 @@ def process_webhook(db: Session, event: WebhookIn, payload: dict) -> tuple[Webho
     """
     existing = _find_event(db, event.event_id)
     if existing is not None:
-        log.info("event=webhook_duplicate event_id=%s", event.event_id)
+        log_event(log, logging.INFO, "webhook_duplicate", event_id=event.event_id, concurrent=False)
         return existing, True
 
     payment = db.scalar(select(Payment).where(Payment.provider_reference == event.provider_reference))
@@ -130,7 +131,7 @@ def process_webhook(db: Session, event: WebhookIn, payload: dict) -> tuple[Webho
         existing = _find_event(db, event.event_id)
         if existing is None:  # pragma: no cover - the conflicting row was just committed by another request
             raise
-        log.info("event=webhook_duplicate event_id=%s concurrent=true", event.event_id)
+        log_event(log, logging.INFO, "webhook_duplicate", event_id=event.event_id, concurrent=True)
         return existing, True
 
     record.result = apply_payment_result(booking, payment, event.status)
