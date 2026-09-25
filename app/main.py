@@ -8,7 +8,7 @@ from app import models  # noqa: F401  (registers the tables on Base.metadata)
 from app.config import get_settings
 from app.database import Base, engine
 from app.errors import DomainError
-from app.routers import auth, bookings, catalog
+from app.routers import auth, bookings, catalog, payments
 
 DESCRIPTION = """
 Diagnostic test bookings with simulated payments.
@@ -44,6 +44,7 @@ def create_app() -> FastAPI:
     app.include_router(auth.router)
     app.include_router(catalog.router)
     app.include_router(bookings.router)
+    app.include_router(payments.router)
     return app
 
 
