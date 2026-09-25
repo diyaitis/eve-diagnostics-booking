@@ -8,6 +8,8 @@ os.environ["WEBHOOK_SECRET"] = "test-webhook-secret"
 os.environ["BCRYPT_ROUNDS"] = "4"  # keep password hashing fast in tests
 os.environ["ALLOW_SIMULATED_OUTCOME"] = "true"
 os.environ["RATE_LIMIT_ENABLED"] = "false"  # switched on explicitly in test_ratelimit.py
+os.environ.pop("REDIS_URL", None)  # a developer's own Redis must never leak into the tests
+os.environ["CELERY_TASK_ALWAYS_EAGER"] = "true"  # background tasks run inline; no broker needed
 
 _url = os.environ["DATABASE_URL"]
 if not _url.startswith("sqlite") and "test" not in _url.rsplit("/", 1)[-1]:
@@ -18,6 +20,7 @@ from types import SimpleNamespace  # noqa: E402
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
+from app import cache  # noqa: E402
 from app.database import Base, SessionLocal, engine  # noqa: E402
 from app.main import app  # noqa: E402
 from app.ratelimit import reset_all_limiters  # noqa: E402
@@ -30,6 +33,7 @@ def _clean_database():
     Base.metadata.drop_all(engine)
     Base.metadata.create_all(engine)
     reset_all_limiters()
+    cache.use_client(None)  # off unless a test turns it on (test_cache.py)
     yield
 
 

@@ -24,6 +24,14 @@ class Settings(BaseSettings):
 
     rate_limit_enabled: bool = True
 
+    # Redis backs the catalogue cache and the Celery broker. Unset = both are off and the API runs on the
+    # database alone, which is also what the fast test run uses.
+    redis_url: str | None = None
+    catalogue_cache_ttl_seconds: int = 300
+
+    # Run Celery tasks inline instead of sending them to a worker (tests, or a setup without Redis).
+    celery_task_always_eager: bool = False
+
     log_level: str = "INFO"
     log_format: str = "json"  # "json" (one object per line) or "text"
 

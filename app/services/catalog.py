@@ -4,6 +4,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
+from app import cache
 from app.errors import ConflictError, NotFoundError
 from app.models import Centre, CentreTest, DiagnosticTest
 from app.schemas import CentreCreate, CentreUpdate, DiagnosticTestCreate
@@ -74,6 +75,7 @@ def set_offering_price(db: Session, centre_id: int, test_id: int, price: Decimal
     else:
         offering.price = price
     db.commit()
+    cache.invalidate_catalogue()
     db.expire(centre, ["offerings"])
     return centre
 
@@ -84,3 +86,4 @@ def _commit_or_conflict(db: Session, message: str) -> None:
     except IntegrityError:
         db.rollback()
         raise ConflictError(message) from None
+    cache.invalidate_catalogue()
