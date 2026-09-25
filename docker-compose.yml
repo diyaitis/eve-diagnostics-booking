@@ -20,6 +20,8 @@ services:
     image: redis:7-alpine
     # No persistence: the cache can be rebuilt, and queued jobs here are notifications, not money.
     command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6380:6379"   # 6380 on the host so it doesn't clash with a local Redis
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 3s

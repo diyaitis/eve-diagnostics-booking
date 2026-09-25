@@ -3,7 +3,7 @@
 A small backend for booking diagnostic tests at diagnostic centres, with a simulated payment
 provider and an idempotent payment webhook.
 
-**Stack:** Python 3.12 · FastAPI · SQLAlchemy 2 · PostgreSQL · JWT (PyJWT) · bcrypt · pytest · Docker Compose
+**Stack:** Python 3.12 · FastAPI · SQLAlchemy 2 · PostgreSQL · Redis · Celery · JWT (PyJWT) · bcrypt · pytest · Docker Compose
 
 Swagger UI is served at `/docs` (with an **Authorize** button) and the OpenAPI schema at `/openapi.json`.
 
@@ -24,7 +24,7 @@ Swagger UI is served at `/docs` (with an **Authorize** button) and the OpenAPI s
 Requires Docker with Compose.
 
 ```bash
-docker compose up --build -d          # PostgreSQL + the API on http://localhost:8000
+docker compose up --build -d          # PostgreSQL, Redis, a Celery worker + the API on http://localhost:8000
 docker compose exec api python -m app.seed   # demo centres/tests + an admin user
 ```
 
@@ -37,16 +37,18 @@ Stop with `docker compose down` (add `-v` to also delete the database volume).
 
 ## Running the API without Docker
 
-Only PostgreSQL needs to be in a container; the API runs from a virtualenv.
+Only PostgreSQL (and, for caching and background jobs, Redis) needs to be in a container; the API runs from a
+virtualenv.
 
 ```bash
-docker compose up -d db                      # PostgreSQL on localhost:5433
+docker compose up -d db redis                # PostgreSQL on localhost:5433, Redis on localhost:6380
 python -m venv .venv
 source .venv/bin/activate                    # Windows: .venv\Scripts\activate
 pip install -r requirements-dev.txt
 cp .env.example .env                         # then edit the secrets
 uvicorn app.main:app --reload
 python -m app.seed                           # optional demo data
+celery -A app.worker worker --beat           # optional: background jobs (needs REDIS_URL in .env)
 ```
 
 Tables are created automatically on startup. Configuration is by environment variable (see
@@ -61,16 +63,20 @@ Tables are created automatically on startup. Configuration is by environment var
 | `PAYMENT_SUCCESS_RATE` | `0.8` | Chance the simulated provider approves a payment |
 | `ALLOW_SIMULATED_OUTCOME` | `true` | Allow forcing an outcome via `simulate_outcome` |
 | `RATE_LIMIT_ENABLED` | `true` | Turn the login/signup/webhook rate limits on or off |
+| `REDIS_URL` | *(unset)* | Enables the catalogue cache and background jobs, e.g. `redis://localhost:6380/0`. Unset = the API runs on the database alone |
+| `CATALOGUE_CACHE_TTL_SECONDS` | `300` | How long a cached catalogue response may live |
+| `UNPAID_BOOKING_EXPIRY_HOURS` | `24` | A booking with no payment attempt is cancelled after this long |
 | `LOG_FORMAT` | `json` | `json` (one object per line) or `text` (easier to read while developing) |
 | `LOG_LEVEL` | `INFO` | Standard Python log level |
 
 ## Running the tests
 
-144 tests: unit tests for the state machine, security, rate limiter and retry helpers, and API-level tests for
-every endpoint and edge case.
+176 tests: unit tests for the state machine, security, rate limiter, cache and retry helpers, and API-level tests for
+every endpoint and edge case. Redis is replaced by an in-memory fake and Celery runs tasks inline, so no extra service
+is needed to run them.
 
 ```bash
-# Fast: in-memory SQLite (141 tests run, 3 are skipped - see below)
+# Fast: in-memory SQLite (173 tests run, 3 are skipped - see below)
 pytest
 
 # Full: real PostgreSQL, including the concurrency tests
@@ -301,9 +307,11 @@ A **payment** only moves `PENDING → SUCCESS` or `PENDING → FAILED`, and neve
 |---|---|
 | Docker and docker-compose | `Dockerfile`, `docker-compose.yml`: the API, PostgreSQL and a containerised test run |
 | Swagger / OpenAPI | `/docs` and `/openapi.json`, with an **Authorize** button |
-| Unit and integration tests | `tests/`: 144 tests, including concurrency tests against PostgreSQL |
+| Unit and integration tests | `tests/`: 176 tests, including concurrency tests against PostgreSQL |
 | Pagination | Every list endpoint: `limit`, `offset`, and a `total` |
 | Structured logging | JSON, one object per line, with a request id on every line (`app/logging_config.py`, `app/middleware.py`) |
+| Redis caching | Catalogue reads cached with a TTL and version-based invalidation; works without Redis (`app/cache.py`) |
+| Background jobs (Celery) | Booking notifications and expiry of unpaid bookings on a Redis-backed worker (`app/worker.py`, `app/tasks.py`) |
 | Rate limiting | Login and signup 10/min, webhook 120/min, per client, `429` + `Retry-After` (`app/ratelimit.py`) |
 | Webhook retry handling | Transient database errors retried with backoff, then `503` + `Retry-After` (`app/services/retry.py`) |
 
@@ -313,12 +321,40 @@ A log line looks like this:
 {"timestamp": "2026-09-25T19:03:28.273+00:00", "level": "INFO", "logger": "app.access", "message": "request", "request_id": "demo-123", "event": "request", "method": "GET", "path": "/health", "status": 200, "duration_ms": 3.3}
 ```
 
-**Deliberately not included: Redis caching and Celery/background jobs.** The catalogue is tiny and read-mostly, and the
-payment flow is synchronous with an idempotent webhook, so neither solves a real problem here - each would add a
-service to run and operate. They are the first things I would add at scale (see below).
+### Redis caching
+
+`GET /centres`, `GET /centres/{id}` and `GET /tests` are read far more often than they change, so their responses are
+cached in Redis (`X-Cache: HIT` or `MISS` shows what happened).
+
+* **Invalidation:** every cache key contains a version number, and any catalogue write (new centre or test, rename, price
+  change) bumps it *after* it has committed. Old entries are never read again and expire by TTL. So a price change is
+  visible on the very next read, and a read that started before the write cannot re-cache stale data.
+* **Prices for bookings never come from the cache:** a booking reads the offering from the database.
+* **Redis is optional.** With no `REDIS_URL`, or when Redis is down, requests go straight to the database. After a
+  failure Redis is left alone for 5 seconds, so an outage costs one slow request rather than one per request.
+* Errors (such as a `404`) are not cached. If a write's invalidation is lost because Redis was down at that moment,
+  stale entries live at most `CATALOGUE_CACHE_TTL_SECONDS`.
+
+### Background jobs (Celery)
+
+A worker (`celery -A app.worker worker --beat`, the `worker` service in compose) runs two jobs:
+
+* **`send_booking_notification`** is queued after a booking is confirmed, its payment is declined, or it is cancelled.
+  Sending is simulated by a log line (`notification_sent`); a real email/SMS call would go there, which is exactly what
+  should not sit inside an API request. It is queued only *after* the change has committed, and only when the status
+  actually changed, so a duplicate webhook delivery does not notify twice.
+* **`expire_unpaid_bookings`** runs every 15 minutes and cancels bookings that never had a payment attempt within
+  `UNPAID_BOOKING_EXPIRY_HOURS`. A booking with a payment in flight is left for its webhook, and rows are locked and
+  re-checked so it cannot race with a payment being made.
+
+Tasks are acknowledged only when finished and are written to be safe to run twice. A database blip retries the
+notification with backoff. **Queueing never fails a request:** if the broker is unreachable the work is skipped with a
+`notification_not_queued` warning, and publishing pauses for 30 seconds so a dead broker cannot slow every request.
+Trade-off: a notification can be lost if the broker is down at that moment. That is acceptable for notifications, which
+is why payments and webhooks do *not* go through the queue.
 
 The rate limiter is in-memory, so it is per-process: fine for one instance, but several instances would each count
-separately and need a shared store such as Redis.
+separately and would need to share their counters through Redis.
 
 ## Edge cases handled
 
@@ -373,15 +409,15 @@ separately and need a shared store such as Redis.
 * **Alembic migrations** instead of `create_all`, plus a CI pipeline running the suite on SQLite and PostgreSQL.
 * **Refunds and reconciliation:** a `REFUNDED` state, a refund flow for the "paid after cancel" case, and a job that
   chases payments stuck in `PENDING`.
-* **Webhook processing in the background** (Celery/Redis or a transactional outbox) with retries and a dead-letter
-  queue, so a slow handler never makes the provider time out. Also key rotation for the signing secret.
+* **Webhook processing in the background** through a transactional outbox (so a queued job cannot be lost) with a
+  dead-letter queue, so a slow handler never makes the provider time out. The same outbox would make notifications
+  reliable. Also key rotation for the signing secret.
 * **`Idempotency-Key` header** on `POST /bookings` and `POST /payments/`, so a client retry after a network error can't
   double-submit.
 * **Availability:** slots and capacity per centre and per test, opening hours, centre time zones, reminders.
-* **Security hardening:** a shared (Redis) rate-limit store for multi-instance deployments and per-user limits, refresh
+* **Security hardening:** a shared (Redis-backed) rate-limit store for multi-instance deployments and per-user limits, refresh
   tokens with revocation, account lockout.
-* **Operations:** metrics and tracing, a readiness check that pings the database, Redis caching for the read-heavy
-  catalogue, soft-delete of centres, and admin views of all bookings.
+* **Operations:** metrics and tracing, a readiness check that pings the database and Redis, soft-delete of centres, and admin views of all bookings.
 
 ---
 
@@ -398,6 +434,9 @@ app/
   logging_config.py  structured JSON logging, request-id context
   middleware.py    request id + one access-log line per request
   ratelimit.py     sliding-window rate limiter and its dependencies
+  cache.py         Redis catalogue cache with version-based invalidation
+  worker.py        Celery app, schedule and broker-failure handling
+  tasks.py         background jobs: notifications, expiring unpaid bookings
   deps.py          auth dependencies, pagination
   errors.py        domain errors -> HTTP status codes
   routers/         thin HTTP layer (auth, catalog, bookings, payments)
