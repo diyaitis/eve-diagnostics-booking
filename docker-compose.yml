@@ -1,0 +1,46 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: eve
+      POSTGRES_PASSWORD: eve
+      POSTGRES_DB: eve
+    ports:
+      - "5433:5432"   # 5433 on the host so it doesn't clash with a local PostgreSQL
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro   # also creates the eve_test database
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U eve -d eve"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build: .
+    environment:
+      DATABASE_URL: postgresql+psycopg://eve:eve@db:5432/eve
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-production-use-a-random-32-byte-value}
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-dev-webhook-secret}
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # docker compose --profile test run --rm tests
+  tests:
+    profiles: ["test"]
+    build:
+      context: .
+      args:
+        INSTALL_DEV: "true"
+    environment:
+      TEST_DATABASE_URL: postgresql+psycopg://eve:eve@db:5432/eve_test
+    depends_on:
+      db:
+        condition: service_healthy
+    command: pytest -q
+
+volumes:
+  pgdata:
