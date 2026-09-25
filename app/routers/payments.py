@@ -10,6 +10,7 @@ from pydantic import ValidationError
 from app.config import get_settings
 from app.deps import CurrentUser, DbSession, PaymentProvider
 from app.logging_config import log_event
+from app.ratelimit import webhook_limit
 from app.schemas import PaymentCreate, PaymentOut, WebhookIn, WebhookOut
 from app.security import verify_webhook_signature
 from app.services import payments
@@ -42,7 +43,7 @@ async def _raw_body(request: Request) -> bytes:
     return await request.body()
 
 
-@router.post("/webhook/", response_model=WebhookOut)
+@router.post("/webhook/", response_model=WebhookOut, dependencies=[Depends(webhook_limit)])
 def payment_webhook(
     body: Annotated[bytes, Depends(_raw_body)],
     db: DbSession,

@@ -7,6 +7,7 @@ os.environ["JWT_SECRET"] = "test-jwt-secret-that-is-at-least-32-bytes-long"
 os.environ["WEBHOOK_SECRET"] = "test-webhook-secret"
 os.environ["BCRYPT_ROUNDS"] = "4"  # keep password hashing fast in tests
 os.environ["ALLOW_SIMULATED_OUTCOME"] = "true"
+os.environ["RATE_LIMIT_ENABLED"] = "false"  # switched on explicitly in test_ratelimit.py
 
 _url = os.environ["DATABASE_URL"]
 if not _url.startswith("sqlite") and "test" not in _url.rsplit("/", 1)[-1]:
@@ -19,6 +20,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from app.database import Base, SessionLocal, engine  # noqa: E402
 from app.main import app  # noqa: E402
+from app.ratelimit import reset_all_limiters  # noqa: E402
 from app.services import users  # noqa: E402
 from tests.helpers import future, login_headers, signup_and_login  # noqa: E402
 
@@ -27,6 +29,7 @@ from tests.helpers import future, login_headers, signup_and_login  # noqa: E402
 def _clean_database():
     Base.metadata.drop_all(engine)
     Base.metadata.create_all(engine)
+    reset_all_limiters()
     yield
 
 

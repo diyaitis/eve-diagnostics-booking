@@ -22,6 +22,8 @@ class Settings(BaseSettings):
     payment_success_rate: float = 0.8
     allow_simulated_outcome: bool = True
 
+    rate_limit_enabled: bool = True
+
     log_level: str = "INFO"
     log_format: str = "json"  # "json" (one object per line) or "text"
 
