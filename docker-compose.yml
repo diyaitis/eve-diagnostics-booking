@@ -16,16 +16,40 @@ services:
       timeout: 3s
       retries: 20
 
+  redis:
+    image: redis:7-alpine
+    # No persistence: the cache can be rebuilt, and queued jobs here are notifications, not money.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
   api:
     build: .
-    environment:
+    environment: &app-env
       DATABASE_URL: postgresql+psycopg://eve:eve@db:5432/eve
+      REDIS_URL: redis://redis:6379/0
       JWT_SECRET: ${JWT_SECRET:-change-me-in-production-use-a-random-32-byte-value}
       WEBHOOK_SECRET: ${WEBHOOK_SECRET:-dev-webhook-secret}
     ports:
       - "8000:8000"
     depends_on:
       db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # Runs the background jobs (booking notifications, expiring unpaid bookings) and their scheduler.
+  worker:
+    build: .
+    environment: *app-env
+    command: celery -A app.worker worker --beat --loglevel=INFO
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
         condition: service_healthy
 
   # docker compose --profile test run --rm tests

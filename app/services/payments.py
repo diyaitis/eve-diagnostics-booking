@@ -79,9 +79,12 @@ def create_payment(
         raise ConflictError("A payment for this booking is already in progress or completed") from None
 
     outcome = provider.charge(payment.provider_reference, payment.amount, data.simulate_outcome)
+    status_before = booking.status
     if outcome != PaymentStatus.PENDING:
         apply_payment_result(booking, payment, outcome)
     db.commit()
+    if booking.status != status_before:
+        bookings.notify(booking)
     log_event(log, logging.INFO, "payment_created", payment_id=payment.id, booking_id=booking.id, status=payment.status.value)
     return payment
 
@@ -134,6 +137,9 @@ def process_webhook(db: Session, event: WebhookIn, payload: dict) -> tuple[Webho
         log_event(log, logging.INFO, "webhook_duplicate", event_id=event.event_id, concurrent=True)
         return existing, True
 
+    status_before = booking.status
     record.result = apply_payment_result(booking, payment, event.status)
     db.commit()
+    if booking.status != status_before:
+        bookings.notify(booking)
     return record, False

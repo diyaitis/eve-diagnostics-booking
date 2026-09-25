@@ -30,6 +30,30 @@ def transition(booking: Booking, new_status: BookingStatus) -> None:
     booking.status = new_status
 
 
+def notify(booking: Booking) -> None:
+    """Queues an email/SMS about the booking's current status. Call it only after the change is committed.
+
+    Never raises: a broker outage must not fail a request whose database work already succeeded, and
+    a missed notification is preferable to telling the client an error happened when it did not.
+    """
+    from app import tasks  # imported here because tasks itself uses this module
+    from app import worker
+
+    if not worker.background_jobs_enabled() or booking.status not in tasks.SUBJECTS:
+        return
+    if worker.broker_recently_failed():
+        log_event(log, logging.WARNING, "notification_not_queued", booking_id=str(booking.id), error="broker_down")
+        return
+    try:
+        tasks.send_booking_notification.delay(str(booking.id), booking.status.value)
+    except Exception as exc:  # noqa: BLE001 - see docstring
+        worker.mark_broker_failed()
+        log_event(
+            log, logging.WARNING, "notification_not_queued",
+            booking_id=str(booking.id), error=type(exc).__name__,
+        )
+
+
 def create_booking(db: Session, user: User, data: BookingCreate) -> Booking:
     offering = db.get(CentreTest, (data.centre_id, data.test_id))
     if offering is None:
@@ -83,4 +107,5 @@ def cancel_booking(db: Session, user: User, booking_id: uuid.UUID) -> Booking:
     booking = get_owned_booking(db, user, booking_id, for_update=True)
     transition(booking, BookingStatus.CANCELLED)
     db.commit()
+    notify(booking)
     return booking

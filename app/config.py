@@ -31,6 +31,7 @@ class Settings(BaseSettings):
 
     # Run Celery tasks inline instead of sending them to a worker (tests, or a setup without Redis).
     celery_task_always_eager: bool = False
+    unpaid_booking_expiry_hours: int = 24  # a booking that is never paid for is cancelled after this long
 
     log_level: str = "INFO"
     log_format: str = "json"  # "json" (one object per line) or "text"
