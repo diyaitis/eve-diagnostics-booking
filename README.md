@@ -60,14 +60,17 @@ Tables are created automatically on startup. Configuration is by environment var
 | `WEBHOOK_SECRET` | `dev-webhook-secret` | Shared secret for webhook signatures |
 | `PAYMENT_SUCCESS_RATE` | `0.8` | Chance the simulated provider approves a payment |
 | `ALLOW_SIMULATED_OUTCOME` | `true` | Allow forcing an outcome via `simulate_outcome` |
+| `RATE_LIMIT_ENABLED` | `true` | Turn the login/signup/webhook rate limits on or off |
+| `LOG_FORMAT` | `json` | `json` (one object per line) or `text` (easier to read while developing) |
+| `LOG_LEVEL` | `INFO` | Standard Python log level |
 
 ## Running the tests
 
-107 tests: unit tests for the state machine and security helpers, and API-level tests for every
-endpoint and edge case.
+144 tests: unit tests for the state machine, security, rate limiter and retry helpers, and API-level tests for
+every endpoint and edge case.
 
 ```bash
-# Fast: in-memory SQLite (104 tests run, 3 are skipped - see below)
+# Fast: in-memory SQLite (141 tests run, 3 are skipped - see below)
 pytest
 
 # Full: real PostgreSQL, including the concurrency tests
@@ -159,6 +162,9 @@ Notes on the responses:
 * A **declined payment is not an HTTP error**: `POST /payments/` returns `201` with `"status": "FAILED"`,
   because a payment was created and processed. Errors (`401/403/404/409/422`) are for invalid requests.
 * Errors are JSON: `{"detail": "..."}`; validation errors use FastAPI's standard `422` shape.
+* Too many requests to login, signup or the webhook: `429` with a `Retry-After` header. If the database is briefly
+  unavailable the webhook answers `503` with `Retry-After` (see [retry handling](#how-the-webhook-stays-idempotent)).
+* Every response has an `X-Request-ID` header; send your own (letters, digits, `._-`, up to 64 characters) to trace a call.
 
 ### Webhook result values
 
@@ -282,8 +288,37 @@ A **payment** only moves `PENDING → SUCCESS` or `PENDING → FAILED`, and neve
 5. **Retry-friendly status codes.** An unknown payment reference returns `404` *and stores nothing*, so the provider
    can retry once the payment exists. A known payment always returns `200` - even for an ignored event - so the
    provider doesn't retry forever.
+6. **Transient failures are retried.** If processing hits a deadlock, lock timeout or dropped connection, the session is
+   rolled back and the event is processed again (up to 3 attempts, backoff 50 ms then 100 ms) - safe precisely because
+   the handler is idempotent. If the database is still failing, the endpoint answers `503` + `Retry-After` and stores
+   nothing, so the provider's own retry is handled normally. Real bugs are not retried or disguised as outages.
 
 ---
+
+## Bonus features
+
+| Feature | Where to look |
+|---|---|
+| Docker and docker-compose | `Dockerfile`, `docker-compose.yml`: the API, PostgreSQL and a containerised test run |
+| Swagger / OpenAPI | `/docs` and `/openapi.json`, with an **Authorize** button |
+| Unit and integration tests | `tests/`: 144 tests, including concurrency tests against PostgreSQL |
+| Pagination | Every list endpoint: `limit`, `offset`, and a `total` |
+| Structured logging | JSON, one object per line, with a request id on every line (`app/logging_config.py`, `app/middleware.py`) |
+| Rate limiting | Login and signup 10/min, webhook 120/min, per client, `429` + `Retry-After` (`app/ratelimit.py`) |
+| Webhook retry handling | Transient database errors retried with backoff, then `503` + `Retry-After` (`app/services/retry.py`) |
+
+A log line looks like this:
+
+```json
+{"timestamp": "2026-09-25T19:03:28.273+00:00", "level": "INFO", "logger": "app.access", "message": "request", "request_id": "demo-123", "event": "request", "method": "GET", "path": "/health", "status": 200, "duration_ms": 3.3}
+```
+
+**Deliberately not included: Redis caching and Celery/background jobs.** The catalogue is tiny and read-mostly, and the
+payment flow is synchronous with an idempotent webhook, so neither solves a real problem here - each would add a
+service to run and operate. They are the first things I would add at scale (see below).
+
+The rate limiter is in-memory, so it is per-process: fine for one instance, but several instances would each count
+separately and need a shared store such as Redis.
 
 ## Edge cases handled
 
@@ -309,6 +344,9 @@ A **payment** only moves `PENDING → SUCCESS` or `PENDING → FAILED`, and neve
 | Webhook: unknown payment, malformed or non-JSON body, `PENDING` status | `404` / `422`, nothing stored |
 | Payment settles after the booking was cancelled | Payment recorded as `SUCCESS`, booking stays `CANCELLED`, warning logged with `needs_refund=true` |
 | LIKE wildcards in search (`q=%`) | Treated literally |
+| Brute-forcing login, mass signups, flooding the webhook URL | `429` + `Retry-After`; refused attempts don't extend the wait |
+| Webhook hits a deadlock / dropped connection | Rolled back and retried; if it persists, `503` + `Retry-After` and nothing stored |
+| Unsafe `X-Request-ID` (spaces, newlines, very long) | Replaced with a generated id, so logs can't be polluted |
 
 ---
 
@@ -340,9 +378,10 @@ A **payment** only moves `PENDING → SUCCESS` or `PENDING → FAILED`, and neve
 * **`Idempotency-Key` header** on `POST /bookings` and `POST /payments/`, so a client retry after a network error can't
   double-submit.
 * **Availability:** slots and capacity per centre and per test, opening hours, centre time zones, reminders.
-* **Security hardening:** rate limiting on login and the webhook, refresh tokens with revocation, account lockout.
-* **Operations:** JSON logs with request IDs, metrics, a readiness check that pings the database, Redis caching for the
-  read-heavy catalogue, soft-delete of centres, and admin views of all bookings.
+* **Security hardening:** a shared (Redis) rate-limit store for multi-instance deployments and per-user limits, refresh
+  tokens with revocation, account lockout.
+* **Operations:** metrics and tracing, a readiness check that pings the database, Redis caching for the read-heavy
+  catalogue, soft-delete of centres, and admin views of all bookings.
 
 ---
 
@@ -356,10 +395,13 @@ app/
   models.py        tables, constraints, enums (the schema, documented inline)
   schemas.py       request/response models and validation
   security.py      password hashing, JWT, webhook signatures
+  logging_config.py  structured JSON logging, request-id context
+  middleware.py    request id + one access-log line per request
+  ratelimit.py     sliding-window rate limiter and its dependencies
   deps.py          auth dependencies, pagination
   errors.py        domain errors -> HTTP status codes
   routers/         thin HTTP layer (auth, catalog, bookings, payments)
-  services/        business rules: bookings (state machine), payments (+ webhook), catalog, users, mock provider
+  services/        business rules: bookings (state machine), payments (+ webhook), catalog, users, retry, mock provider
   seed.py          demo data and first admin
 tests/             pytest suite (fixtures in conftest.py)
 docker/initdb/     creates the eve_test database
