@@ -6,6 +6,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
 from pydantic import ValidationError
+from sqlalchemy.exc import OperationalError
 
 from app.config import get_settings
 from app.deps import CurrentUser, DbSession, PaymentProvider
@@ -14,6 +15,7 @@ from app.ratelimit import webhook_limit
 from app.schemas import PaymentCreate, PaymentOut, WebhookIn, WebhookOut
 from app.security import verify_webhook_signature
 from app.services import payments
+from app.services.retry import call_with_retries
 
 log = logging.getLogger(__name__)
 
@@ -64,5 +66,18 @@ def payment_webhook(
             exc.errors(include_url=False, include_context=False, include_input=False)
         ) from None
 
-    record, duplicate = payments.process_webhook(db, event, json.loads(body))
+    payload = json.loads(body)
+    try:
+        # Safe to retry: an event_id is applied at most once, however many times this runs.
+        record, duplicate = call_with_retries(
+            lambda: payments.process_webhook(db, event, payload), on_retry=db.rollback
+        )
+    except OperationalError:
+        # Still failing after the retries: tell the provider to try again later rather than lose the event.
+        log_event(log, logging.ERROR, "webhook_unavailable", event_id=event.event_id)
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Temporarily unable to process this event; please retry",
+            headers={"Retry-After": "5"},
+        ) from None
     return WebhookOut(event_id=record.event_id, result=record.result, duplicate=duplicate)
